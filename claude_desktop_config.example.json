@@ -1,0 +1,20 @@
+{
+  "_comment": "Paste the contents of THIS FILE into your Claude Desktop config.",
+  "_location_mac":     "~/Library/Application Support/Claude/claude_desktop_config.json",
+  "_location_windows": "%APPDATA%\\Claude\\claude_desktop_config.json",
+  "_location_linux":   "~/.config/claude/claude_desktop_config.json",
+
+  "mcpServers": {
+    "gtiti": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/REPLACE/THIS/WITH/YOUR/FULL/PATH/TO/gtiti",
+        "python",
+        "-m",
+        "src.server"
+      ]
+    }
+  }
+}
