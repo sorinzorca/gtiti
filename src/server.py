@@ -1,5 +1,5 @@
 """
-GTITI MCP Server — Phase 1 + Phase 2 + Connector 7
+GTITI MCP Server — Phase 1 + Phase 2 + Connectors 7-8
 """
 
 import asyncio
@@ -21,6 +21,7 @@ from src.connectors.crunchbase import get_company_intelligence
 from src.connectors.submarine import get_operator_cables, get_cables_by_country
 from src.connectors.contacts import get_wholesale_contacts
 from src.connectors.bgp_tools import get_asn_classification
+from src.connectors.caida import get_as_rank
 
 app = Server("gtiti")
 
@@ -68,8 +69,13 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={"type": "object", "properties": {"asn": {"type": "string", "description": "ASN as a number or 'AS' prefixed string. Examples: '1257', 'AS1257', 'AS3320'"}}, "required": ["asn"]},
         ),
         types.Tool(
+            name="gtiti_as_rank",
+            description="Get CAIDA's global AS rank, customer cone size, and provider/peer/customer relationship counts for an ASN. Reveals whether a network is transit-free (Tier 1), an edge network, or a middle network, and how many downstream ASNs, prefixes, and IP addresses it can reach. Use this when asked: 'how significant is AS1257 in the global routing system?', 'what's the customer cone of Cogent?', 'is this operator transit-free?'.",
+            inputSchema={"type": "object", "properties": {"asn": {"type": "string", "description": "ASN as a number or 'AS' prefixed string. Examples: '1257', 'AS1257', 'AS3320'"}}, "required": ["asn"]},
+        ),
+        types.Tool(
             name="gtiti_full_briefing",
-            description="Generate a COMPLETE operator briefing combining ALL data sources: ASNs, IXP presence, BGP prefixes, peering contacts, network classification, recent news, Crunchbase financials, submarine cable memberships, and wholesale LinkedIn contacts. Use this when asked: 'Prepare a full briefing on Tele2 Sweden', 'I have a meeting with Deutsche Telekom, give me everything', 'complete profile of NTT Communications'.",
+            description="Generate a COMPLETE operator briefing combining ALL data sources: ASNs, IXP presence, BGP prefixes, peering contacts, network classification, AS rank and customer cone, recent news, Crunchbase financials, submarine cable memberships, and wholesale LinkedIn contacts. Use this when asked: 'Prepare a full briefing on Tele2 Sweden', 'I have a meeting with Deutsche Telekom, give me everything', 'complete profile of NTT Communications'.",
             inputSchema={"type": "object", "properties": {"operator_name": {"type": "string", "description": "Operator name. Examples: 'Tele2 Sweden', 'Deutsche Telekom', 'NTT Communications'"}}, "required": ["operator_name"]},
         ),
     ]
@@ -122,6 +128,11 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             if not asn:
                 raise ValueError("'asn' parameter is required.")
             result = await get_asn_classification(asn)
+        elif name == "gtiti_as_rank":
+            asn = arguments.get("asn", "").strip()
+            if not asn:
+                raise ValueError("'asn' parameter is required.")
+            result = await get_as_rank(asn)
         elif name == "gtiti_full_briefing":
             operator_name = arguments.get("operator_name", "").strip()
             if not operator_name:
@@ -129,10 +140,14 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             phase1_result, phase2_result = await asyncio.gather(lookup_operator(operator_name), build_full_briefing(operator_name))
             primary_asn = phase1_result.get("primary_asn", "")
             if primary_asn:
-                bgp_classification = await get_asn_classification(primary_asn)
+                bgp_classification, as_rank = await asyncio.gather(
+                    get_asn_classification(primary_asn),
+                    get_as_rank(primary_asn),
+                )
             else:
                 bgp_classification = {"error": "No primary ASN found for this operator."}
-            result = {"operator": operator_name, "network_data": phase1_result, "bgp_classification": bgp_classification, **phase2_result}
+                as_rank = {"error": "No primary ASN found for this operator."}
+            result = {"operator": operator_name, "network_data": phase1_result, "bgp_classification": bgp_classification, "as_rank": as_rank, **phase2_result}
         else:
             result = {"status": "error", "message": f"Unknown tool: '{name}'."}
     except Exception as e:
@@ -143,7 +158,7 @@ def main():
     print("🌐 GTITI MCP Server starting...", file=sys.stderr)
     print("   Phase 1: operator lookup · country operators · IXP lookup", file=sys.stderr)
     print("   Phase 2: news · crunchbase · submarine cables · contacts · full briefing", file=sys.stderr)
-    print("   Phase 3: bgp.tools network classification", file=sys.stderr)
+    print("   Phase 3: bgp.tools classification · CAIDA AS rank", file=sys.stderr)
     print("   Ready. Waiting for Claude to connect...", file=sys.stderr)
     async def run():
         async with mcp.server.stdio.stdio_server() as (r, w):
