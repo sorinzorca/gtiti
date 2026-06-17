@@ -1,5 +1,5 @@
 """
-GTITI MCP Server — Phase 1 + Phase 2 + Connectors 7-10
+GTITI MCP Server — Phase 1 + Phase 2 + Connectors 7-11
 """
 
 import asyncio
@@ -24,6 +24,7 @@ from src.connectors.bgp_tools import get_asn_classification
 from src.connectors.caida import get_as_rank
 from src.connectors.cloudflare_radar import get_radar_profile
 from src.connectors.routing_history import get_routing_history
+from src.connectors.shodan_exposure import check_exposure
 
 app = Server("gtiti")
 
@@ -86,8 +87,13 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={"type": "object", "properties": {"asn": {"type": "string", "description": "ASN as a number or 'AS' prefixed string. Examples: '1257', 'AS1257', 'AS3320'"}, "months_back": {"type": "integer", "description": "How many months back to look. Default 12.", "default": 12}}, "required": ["asn"]},
         ),
         types.Tool(
+            name="gtiti_security_exposure",
+            description="Spot-check a telecom operator's network for exposed services, open risky ports (SSH, Telnet, RDP, SMB, VNC), and known CVEs using Shodan InternetDB. Looks up the operator's announced prefixes (via PeeringDB/RIPE) and checks sample gateway IPs from each. Free, no key, updated weekly. This is a spot-check on a handful of IPs, not a full network sweep. Use this when asked: 'does Tele2 have any exposed services?', 'security exposure check for Cogent', 'any known CVEs on this operator's network?'.",
+            inputSchema={"type": "object", "properties": {"operator_name": {"type": "string", "description": "Operator name. Examples: 'Tele2 Sweden', 'Deutsche Telekom'"}}, "required": ["operator_name"]},
+        ),
+        types.Tool(
             name="gtiti_full_briefing",
-            description="Generate a COMPLETE operator briefing combining ALL data sources: ASNs, IXP presence, BGP prefixes, peering contacts, network classification, AS rank and customer cone, RPKI/routing security health, BGP routing history and anomalies, recent news, Crunchbase financials, submarine cable memberships, and wholesale LinkedIn contacts. Use this when asked: 'Prepare a full briefing on Tele2 Sweden', 'I have a meeting with Deutsche Telekom, give me everything', 'complete profile of NTT Communications'.",
+            description="Generate a COMPLETE operator briefing combining ALL data sources: ASNs, IXP presence, BGP prefixes, peering contacts, network classification, AS rank and customer cone, RPKI/routing security health, BGP routing history and anomalies, security exposure spot-check, recent news, Crunchbase financials, submarine cable memberships, and wholesale LinkedIn contacts. Use this when asked: 'Prepare a full briefing on Tele2 Sweden', 'I have a meeting with Deutsche Telekom, give me everything', 'complete profile of NTT Communications'.",
             inputSchema={"type": "object", "properties": {"operator_name": {"type": "string", "description": "Operator name. Examples: 'Tele2 Sweden', 'Deutsche Telekom', 'NTT Communications'"}}, "required": ["operator_name"]},
         ),
     ]
@@ -156,25 +162,36 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 raise ValueError("'asn' parameter is required.")
             months_back = int(arguments.get("months_back", 12))
             result = await get_routing_history(asn, months_back=months_back)
+        elif name == "gtiti_security_exposure":
+            operator_name = arguments.get("operator_name", "").strip()
+            if not operator_name:
+                raise ValueError("'operator_name' parameter is required.")
+            operator_data = await lookup_operator(operator_name)
+            prefixes = operator_data.get("sample_prefixes_ipv4", [])
+            result = await check_exposure(prefixes)
+            result["operator"] = operator_name
         elif name == "gtiti_full_briefing":
             operator_name = arguments.get("operator_name", "").strip()
             if not operator_name:
                 raise ValueError("'operator_name' parameter is required.")
             phase1_result, phase2_result = await asyncio.gather(lookup_operator(operator_name), build_full_briefing(operator_name))
             primary_asn = phase1_result.get("primary_asn", "")
+            prefixes = phase1_result.get("sample_prefixes_ipv4", [])
             if primary_asn:
-                bgp_classification, as_rank, radar_profile, routing_history = await asyncio.gather(
+                bgp_classification, as_rank, radar_profile, routing_history, security_exposure = await asyncio.gather(
                     get_asn_classification(primary_asn),
                     get_as_rank(primary_asn),
                     get_radar_profile(primary_asn),
                     get_routing_history(primary_asn),
+                    check_exposure(prefixes),
                 )
             else:
                 bgp_classification = {"error": "No primary ASN found for this operator."}
                 as_rank = {"error": "No primary ASN found for this operator."}
                 radar_profile = {"error": "No primary ASN found for this operator."}
                 routing_history = {"error": "No primary ASN found for this operator."}
-            result = {"operator": operator_name, "network_data": phase1_result, "bgp_classification": bgp_classification, "as_rank": as_rank, "cloudflare_radar": radar_profile, "routing_history": routing_history, **phase2_result}
+                security_exposure = {"error": "No primary ASN found for this operator."}
+            result = {"operator": operator_name, "network_data": phase1_result, "bgp_classification": bgp_classification, "as_rank": as_rank, "cloudflare_radar": radar_profile, "routing_history": routing_history, "security_exposure": security_exposure, **phase2_result}
         else:
             result = {"status": "error", "message": f"Unknown tool: '{name}'."}
     except Exception as e:
@@ -185,7 +202,7 @@ def main():
     print("🌐 GTITI MCP Server starting...", file=sys.stderr)
     print("   Phase 1: operator lookup · country operators · IXP lookup", file=sys.stderr)
     print("   Phase 2: news · crunchbase · submarine cables · contacts · full briefing", file=sys.stderr)
-    print("   Phase 3: bgp.tools · CAIDA AS rank · Cloudflare Radar · routing history", file=sys.stderr)
+    print("   Phase 3: bgp.tools · CAIDA AS rank · Cloudflare Radar · routing history · Shodan exposure", file=sys.stderr)
     print("   Ready. Waiting for Claude to connect...", file=sys.stderr)
     async def run():
         async with mcp.server.stdio.stdio_server() as (r, w):
