@@ -1,5 +1,5 @@
 """
-GTITI MCP Server — Phase 1 + Phase 2 + Connectors 7-12
+GTITI MCP Server — Phase 1 + Phase 2 + Connectors 7-13
 """
 
 import asyncio
@@ -26,6 +26,7 @@ from src.connectors.cloudflare_radar import get_radar_profile
 from src.connectors.routing_history import get_routing_history
 from src.connectors.shodan_exposure import check_exposure
 from src.connectors.ixpdb import get_ixpdb_presence
+from src.connectors.securitytrails import get_domain_intelligence
 
 app = Server("gtiti")
 
@@ -98,8 +99,13 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={"type": "object", "properties": {"asn": {"type": "string", "description": "ASN as a number or 'AS' prefixed string. Examples: '1257', 'AS1257', 'AS3320'"}}, "required": ["asn"]},
         ),
         types.Tool(
+            name="gtiti_domain_intelligence",
+            description="Get subdomain mapping and historical DNS records for a telecom operator's domain via SecurityTrails. Reveals the operator's full domain infrastructure footprint (subdomains for NOC, customer portals, peering, internal tools) and DNS history showing past IP assignments. Requires a free SecurityTrails API key (2,500 queries/month). Use this when asked: 'what subdomains does Tele2 have?', 'DNS history for tele2.com', 'map this operator's domain infrastructure'.",
+            inputSchema={"type": "object", "properties": {"domain_or_operator": {"type": "string", "description": "A domain name (e.g. 'tele2.com') or operator name to look up via gtiti_operator_lookup first to find their website."}}, "required": ["domain_or_operator"]},
+        ),
+        types.Tool(
             name="gtiti_full_briefing",
-            description="Generate a COMPLETE operator briefing combining ALL data sources: ASNs, IXP presence (PeeringDB + IXPDB cross-check), BGP prefixes, peering contacts, network classification, AS rank and customer cone, RPKI/routing security health, BGP routing history and anomalies, security exposure spot-check, recent news, Crunchbase financials, submarine cable memberships, and wholesale LinkedIn contacts. Use this when asked: 'Prepare a full briefing on Tele2 Sweden', 'I have a meeting with Deutsche Telekom, give me everything', 'complete profile of NTT Communications'.",
+            description="Generate a COMPLETE operator briefing combining ALL data sources: ASNs, IXP presence (PeeringDB + IXPDB cross-check), BGP prefixes, peering contacts, network classification, AS rank and customer cone, RPKI/routing security health, BGP routing history and anomalies, security exposure spot-check, domain/subdomain intelligence, recent news, Crunchbase financials, submarine cable memberships, and wholesale LinkedIn contacts. Use this when asked: 'Prepare a full briefing on Tele2 Sweden', 'I have a meeting with Deutsche Telekom, give me everything', 'complete profile of NTT Communications'.",
             inputSchema={"type": "object", "properties": {"operator_name": {"type": "string", "description": "Operator name. Examples: 'Tele2 Sweden', 'Deutsche Telekom', 'NTT Communications'"}}, "required": ["operator_name"]},
         ),
     ]
@@ -181,6 +187,19 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             if not asn:
                 raise ValueError("'asn' parameter is required.")
             result = await get_ixpdb_presence(asn)
+        elif name == "gtiti_domain_intelligence":
+            domain_or_operator = arguments.get("domain_or_operator", "").strip()
+            if not domain_or_operator:
+                raise ValueError("'domain_or_operator' parameter is required.")
+            if "." in domain_or_operator and " " not in domain_or_operator:
+                result = await get_domain_intelligence(domain_or_operator)
+            else:
+                operator_data = await lookup_operator(domain_or_operator)
+                website = operator_data.get("website", "")
+                if not website:
+                    result = {"error": f"Could not find a website for '{domain_or_operator}' via operator lookup. Try providing a domain directly, e.g. 'tele2.com'."}
+                else:
+                    result = await get_domain_intelligence(website)
         elif name == "gtiti_full_briefing":
             operator_name = arguments.get("operator_name", "").strip()
             if not operator_name:
@@ -188,14 +207,16 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             phase1_result, phase2_result = await asyncio.gather(lookup_operator(operator_name), build_full_briefing(operator_name))
             primary_asn = phase1_result.get("primary_asn", "")
             prefixes = phase1_result.get("sample_prefixes_ipv4", [])
+            website = phase1_result.get("website", "")
             if primary_asn:
-                bgp_classification, as_rank, radar_profile, routing_history, security_exposure, ixpdb_presence = await asyncio.gather(
+                bgp_classification, as_rank, radar_profile, routing_history, security_exposure, ixpdb_presence, domain_intel = await asyncio.gather(
                     get_asn_classification(primary_asn),
                     get_as_rank(primary_asn),
                     get_radar_profile(primary_asn),
                     get_routing_history(primary_asn),
                     check_exposure(prefixes),
                     get_ixpdb_presence(primary_asn),
+                    get_domain_intelligence(website) if website else asyncio.sleep(0, result={"error": "No website found for this operator."}),
                 )
             else:
                 bgp_classification = {"error": "No primary ASN found for this operator."}
@@ -204,7 +225,8 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 routing_history = {"error": "No primary ASN found for this operator."}
                 security_exposure = {"error": "No primary ASN found for this operator."}
                 ixpdb_presence = {"error": "No primary ASN found for this operator."}
-            result = {"operator": operator_name, "network_data": phase1_result, "bgp_classification": bgp_classification, "as_rank": as_rank, "cloudflare_radar": radar_profile, "routing_history": routing_history, "security_exposure": security_exposure, "ixpdb_cross_check": ixpdb_presence, **phase2_result}
+                domain_intel = {"error": "No primary ASN found for this operator."}
+            result = {"operator": operator_name, "network_data": phase1_result, "bgp_classification": bgp_classification, "as_rank": as_rank, "cloudflare_radar": radar_profile, "routing_history": routing_history, "security_exposure": security_exposure, "ixpdb_cross_check": ixpdb_presence, "domain_intelligence": domain_intel, **phase2_result}
         else:
             result = {"status": "error", "message": f"Unknown tool: '{name}'."}
     except Exception as e:
@@ -215,7 +237,7 @@ def main():
     print("🌐 GTITI MCP Server starting...", file=sys.stderr)
     print("   Phase 1: operator lookup · country operators · IXP lookup", file=sys.stderr)
     print("   Phase 2: news · crunchbase · submarine cables · contacts · full briefing", file=sys.stderr)
-    print("   Phase 3: bgp.tools · CAIDA · Cloudflare Radar · routing history · Shodan · IXPDB", file=sys.stderr)
+    print("   Phase 3: bgp.tools · CAIDA · Cloudflare Radar · routing history · Shodan · IXPDB · SecurityTrails", file=sys.stderr)
     print("   Ready. Waiting for Claude to connect...", file=sys.stderr)
     async def run():
         async with mcp.server.stdio.stdio_server() as (r, w):
