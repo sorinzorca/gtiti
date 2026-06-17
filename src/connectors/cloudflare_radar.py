@@ -53,11 +53,22 @@ async def get_radar_profile(asn):
         asn_info = {"error": str(exc)}
 
     stats_result = routing_stats.get("result", {}).get("stats", {}) if isinstance(routing_stats, dict) and "result" in routing_stats else {}
+    routes_total = stats_result.get("routes_total", 0)
+    routes_valid = stats_result.get("routes_valid", 0)
+    routes_invalid = stats_result.get("routes_invalid", 0)
+    routes_unknown = stats_result.get("routes_unknown", 0)
+    rpki_valid_ratio = stats_result.get("rpki_valid_ratio")
+
     rpki = {
-        "valid": stats_result.get("rpki_valid", {}),
-        "invalid": stats_result.get("rpki_invalid", {}),
-        "unknown": stats_result.get("rpki_unknown", {}),
-        "total_prefixes": stats_result.get("pfxs_count", stats_result.get("prefixes_count")),
+        "valid_routes": routes_valid,
+        "invalid_routes": routes_invalid,
+        "unknown_routes": routes_unknown,
+        "total_routes": routes_total,
+        "valid_pct": round(rpki_valid_ratio * 100, 1) if rpki_valid_ratio is not None else None,
+        "invalid_pct": round((routes_invalid / routes_total) * 100, 1) if routes_total else None,
+        "unknown_pct": round((routes_unknown / routes_total) * 100, 1) if routes_total else None,
+        "distinct_prefixes_ipv4": stats_result.get("distinct_prefixes_ipv4"),
+        "distinct_prefixes_ipv6": stats_result.get("distinct_prefixes_ipv6"),
     }
 
     rels_result = relationships.get("result", {}) if isinstance(relationships, dict) and "result" in relationships else {}
@@ -81,7 +92,4 @@ async def get_radar_profile(asn):
         "total_peers_observed": rels_result.get("meta", {}).get("total_peers", len(rels_list)),
         "radar_url": f"https://radar.cloudflare.com/as{asn_int}",
         "data_source": "Cloudflare Radar",
-        "raw_routing_stats": routing_stats if "error" in routing_stats else None,
-        "raw_relationships_error": relationships.get("error") if "error" in relationships else None,
-        "raw_asn_info_error": asn_info.get("error") if "error" in asn_info else None,
     }
