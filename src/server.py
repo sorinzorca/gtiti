@@ -21,12 +21,13 @@ from src.connectors.crunchbase import get_company_intelligence
 from src.connectors.submarine import get_operator_cables, get_cables_by_country
 from src.connectors.contacts import get_wholesale_contacts
 from src.connectors.bgp_tools import get_asn_classification
-from src.connectors.caida import get_as_rank
+from src.connectors.caida import get_as_rank, get_as_relationships
 from src.connectors.cloudflare_radar import get_radar_profile
 from src.connectors.routing_history import get_routing_history
 from src.connectors.shodan_exposure import check_exposure
 from src.connectors.ixpdb import get_ixpdb_presence
 from src.connectors.securitytrails import get_domain_intelligence
+from src.connectors.ipinfo import verify_prefix_ownership
 
 app = Server("gtiti")
 
@@ -79,6 +80,11 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={"type": "object", "properties": {"asn": {"type": "string", "description": "ASN as a number or 'AS' prefixed string. Examples: '1257', 'AS1257', 'AS3320'"}}, "required": ["asn"]},
         ),
         types.Tool(
+            name="gtiti_as_relationships",
+            description="Get the ACTUAL LIST of customer, provider, and peer ASNs for an operator (not just counts) using CAIDA's relationship data. Reveals exactly which networks buy transit from this operator, which networks this operator buys transit from, and who it peers with. Use this when asked: 'who are Tele2's actual upstream providers?', 'list the ASNs that are customers of AS1257', 'what networks does this operator peer with by name?'.",
+            inputSchema={"type": "object", "properties": {"asn": {"type": "string", "description": "ASN as a number or 'AS' prefixed string. Examples: '1257', 'AS1257', 'AS3320'"}, "max_links": {"type": "integer", "description": "Maximum relationship links to fetch (paginated). Default 400, covers most operators fully.", "default": 400}}, "required": ["asn"]},
+        ),
+        types.Tool(
             name="gtiti_cloudflare_radar",
             description="Get Cloudflare Radar's view of an ASN: RPKI validation status (valid/invalid/unknown prefix percentages), AS-level relationships (peers/customers/providers as seen by Cloudflare), estimated user population, and traffic confidence. Requires a free Cloudflare API token. Use this when asked: 'what's the RPKI health of AS1257?', 'does this operator have RPKI invalid routes?', 'how many users does Cloudflare estimate for this ASN?'.",
             inputSchema={"type": "object", "properties": {"asn": {"type": "string", "description": "ASN as a number or 'AS' prefixed string. Examples: '1257', 'AS1257', 'AS3320'"}}, "required": ["asn"]},
@@ -92,6 +98,11 @@ async def list_tools() -> list[types.Tool]:
             name="gtiti_security_exposure",
             description="Spot-check a telecom operator's network for exposed services, open risky ports (SSH, Telnet, RDP, SMB, VNC), and known CVEs using Shodan InternetDB. Looks up the operator's announced prefixes (via PeeringDB/RIPE) and checks sample gateway IPs from each. Free, no key, updated weekly. This is a spot-check on a handful of IPs, not a full network sweep. Use this when asked: 'does Tele2 have any exposed services?', 'security exposure check for Cogent', 'any known CVEs on this operator's network?'.",
             inputSchema={"type": "object", "properties": {"operator_name": {"type": "string", "description": "Operator name. Examples: 'Tele2 Sweden', 'Deutsche Telekom'"}}, "required": ["operator_name"]},
+        ),
+        types.Tool(
+            name="gtiti_verify_prefix_ownership",
+            description="Verify which organization actually owns a telecom operator's announced IP prefixes using IPinfo. Cross-checks PeeringDB/RIPE-reported ownership against an independent IP-to-ASN/org data source, and flags any sample IPs that resolve to an unexpected organization name. Requires a free IPinfo token (unlimited Lite tier, no credit card). Use this when asked: 'verify Tele2 actually owns these IP ranges', 'cross-check prefix ownership for AS1257', 'does this operator's IP space match what they claim?'.",
+            inputSchema={"type": "object", "properties": {"operator_name": {"type": "string", "description": "Operator name. Examples: 'Tele2 Sweden', 'Deutsche Telekom'"}, "expected_org_keyword": {"type": "string", "description": "Optional keyword to check for in the resolved org name, e.g. 'Tele2'. If omitted, just reports what each sampled IP resolves to."}}, "required": ["operator_name"]},
         ),
         types.Tool(
             name="gtiti_ixpdb_lookup",
@@ -163,6 +174,12 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             if not asn:
                 raise ValueError("'asn' parameter is required.")
             result = await get_as_rank(asn)
+        elif name == "gtiti_as_relationships":
+            asn = arguments.get("asn", "").strip()
+            if not asn:
+                raise ValueError("'asn' parameter is required.")
+            max_links = int(arguments.get("max_links", 400))
+            result = await get_as_relationships(asn, max_links=max_links)
         elif name == "gtiti_cloudflare_radar":
             asn = arguments.get("asn", "").strip()
             if not asn:
@@ -181,6 +198,15 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             operator_data = await lookup_operator(operator_name)
             prefixes = operator_data.get("sample_prefixes_ipv4", [])
             result = await check_exposure(prefixes)
+            result["operator"] = operator_name
+        elif name == "gtiti_verify_prefix_ownership":
+            operator_name = arguments.get("operator_name", "").strip()
+            if not operator_name:
+                raise ValueError("'operator_name' parameter is required.")
+            expected_org_keyword = arguments.get("expected_org_keyword", None)
+            operator_data = await lookup_operator(operator_name)
+            prefixes = operator_data.get("sample_prefixes_ipv4", [])
+            result = await verify_prefix_ownership(prefixes, expected_org_keyword=expected_org_keyword)
             result["operator"] = operator_name
         elif name == "gtiti_ixpdb_lookup":
             asn = arguments.get("asn", "").strip()
