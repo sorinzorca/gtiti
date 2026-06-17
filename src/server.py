@@ -1,5 +1,5 @@
 """
-GTITI MCP Server — Phase 1 + Phase 2 + Connectors 7-9
+GTITI MCP Server — Phase 1 + Phase 2 + Connectors 7-10
 """
 
 import asyncio
@@ -23,6 +23,7 @@ from src.connectors.contacts import get_wholesale_contacts
 from src.connectors.bgp_tools import get_asn_classification
 from src.connectors.caida import get_as_rank
 from src.connectors.cloudflare_radar import get_radar_profile
+from src.connectors.routing_history import get_routing_history
 
 app = Server("gtiti")
 
@@ -80,8 +81,13 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={"type": "object", "properties": {"asn": {"type": "string", "description": "ASN as a number or 'AS' prefixed string. Examples: '1257', 'AS1257', 'AS3320'"}}, "required": ["asn"]},
         ),
         types.Tool(
+            name="gtiti_routing_history",
+            description="Get BGP routing history for an ASN over a configurable lookback period: total prefixes seen, currently active prefixes, recently withdrawn prefixes (with withdrawal dates), and any other ASNs observed announcing the same prefixes (a signal for hijacks, reallocations, or anycast/multi-homing). Use this when asked: 'has this operator had any BGP incidents recently?', 'what prefixes has AS1257 withdrawn?', 'any routing anomalies for Cogent in the last year?'.",
+            inputSchema={"type": "object", "properties": {"asn": {"type": "string", "description": "ASN as a number or 'AS' prefixed string. Examples: '1257', 'AS1257', 'AS3320'"}, "months_back": {"type": "integer", "description": "How many months back to look. Default 12.", "default": 12}}, "required": ["asn"]},
+        ),
+        types.Tool(
             name="gtiti_full_briefing",
-            description="Generate a COMPLETE operator briefing combining ALL data sources: ASNs, IXP presence, BGP prefixes, peering contacts, network classification, AS rank and customer cone, RPKI/routing security health, recent news, Crunchbase financials, submarine cable memberships, and wholesale LinkedIn contacts. Use this when asked: 'Prepare a full briefing on Tele2 Sweden', 'I have a meeting with Deutsche Telekom, give me everything', 'complete profile of NTT Communications'.",
+            description="Generate a COMPLETE operator briefing combining ALL data sources: ASNs, IXP presence, BGP prefixes, peering contacts, network classification, AS rank and customer cone, RPKI/routing security health, BGP routing history and anomalies, recent news, Crunchbase financials, submarine cable memberships, and wholesale LinkedIn contacts. Use this when asked: 'Prepare a full briefing on Tele2 Sweden', 'I have a meeting with Deutsche Telekom, give me everything', 'complete profile of NTT Communications'.",
             inputSchema={"type": "object", "properties": {"operator_name": {"type": "string", "description": "Operator name. Examples: 'Tele2 Sweden', 'Deutsche Telekom', 'NTT Communications'"}}, "required": ["operator_name"]},
         ),
     ]
@@ -144,6 +150,12 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             if not asn:
                 raise ValueError("'asn' parameter is required.")
             result = await get_radar_profile(asn)
+        elif name == "gtiti_routing_history":
+            asn = arguments.get("asn", "").strip()
+            if not asn:
+                raise ValueError("'asn' parameter is required.")
+            months_back = int(arguments.get("months_back", 12))
+            result = await get_routing_history(asn, months_back=months_back)
         elif name == "gtiti_full_briefing":
             operator_name = arguments.get("operator_name", "").strip()
             if not operator_name:
@@ -151,16 +163,18 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             phase1_result, phase2_result = await asyncio.gather(lookup_operator(operator_name), build_full_briefing(operator_name))
             primary_asn = phase1_result.get("primary_asn", "")
             if primary_asn:
-                bgp_classification, as_rank, radar_profile = await asyncio.gather(
+                bgp_classification, as_rank, radar_profile, routing_history = await asyncio.gather(
                     get_asn_classification(primary_asn),
                     get_as_rank(primary_asn),
                     get_radar_profile(primary_asn),
+                    get_routing_history(primary_asn),
                 )
             else:
                 bgp_classification = {"error": "No primary ASN found for this operator."}
                 as_rank = {"error": "No primary ASN found for this operator."}
                 radar_profile = {"error": "No primary ASN found for this operator."}
-            result = {"operator": operator_name, "network_data": phase1_result, "bgp_classification": bgp_classification, "as_rank": as_rank, "cloudflare_radar": radar_profile, **phase2_result}
+                routing_history = {"error": "No primary ASN found for this operator."}
+            result = {"operator": operator_name, "network_data": phase1_result, "bgp_classification": bgp_classification, "as_rank": as_rank, "cloudflare_radar": radar_profile, "routing_history": routing_history, **phase2_result}
         else:
             result = {"status": "error", "message": f"Unknown tool: '{name}'."}
     except Exception as e:
@@ -171,7 +185,7 @@ def main():
     print("🌐 GTITI MCP Server starting...", file=sys.stderr)
     print("   Phase 1: operator lookup · country operators · IXP lookup", file=sys.stderr)
     print("   Phase 2: news · crunchbase · submarine cables · contacts · full briefing", file=sys.stderr)
-    print("   Phase 3: bgp.tools · CAIDA AS rank · Cloudflare Radar", file=sys.stderr)
+    print("   Phase 3: bgp.tools · CAIDA AS rank · Cloudflare Radar · routing history", file=sys.stderr)
     print("   Ready. Waiting for Claude to connect...", file=sys.stderr)
     async def run():
         async with mcp.server.stdio.stdio_server() as (r, w):
