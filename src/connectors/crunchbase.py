@@ -51,7 +51,7 @@ async def _get_executives(permalink, limit=6):
 
 async def get_company_intelligence(company_name):
     if not CRUNCHBASE_KEY:
-        return {"company": company_name, "available": False, "message": "CRUNCHBASE_API_KEY not set. Add to .env. Free trial at data.crunchbase.com"}
+        return {"company": company_name, "available": False, "message": "Crunchbase API requires a paid plan ($49+/mo) - no free tier exists as of 2025. Skipped by choice. Other GTITI connectors (news, CAIDA, Cloudflare Radar) provide overlapping financial/corporate signal without cost."}
     try:
         permalink = await _find_permalink(company_name)
         if not permalink:
