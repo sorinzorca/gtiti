@@ -37,8 +37,9 @@ async def get_domain_intelligence(website_or_domain):
             "domain": domain,
             "available": False,
             "message": (
-                "SECURITYTRAILS_API_KEY not set. Add it to .env to enable subdomain mapping, "
-                "DNS history, and associated domain data. Free tier: 2,500 queries/month at securitytrails.com."
+                "SECURITYTRAILS_API_KEY not set. Cheapest plan is $500+/mo with no clear free "
+                "self-service tier - skipped by choice. IXPDB and Shodan InternetDB cover related "
+                "infrastructure signal without cost."
             ),
         }
 
