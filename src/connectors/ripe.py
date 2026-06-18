@@ -95,48 +95,79 @@ async def get_upstreams(asn: int | str) -> dict:
     }
 
 
-async def get_country_asns(country_code: str) -> list[dict]:
+async def get_country_asns(country_code: str, max_to_enrich: int = 30) -> list[dict]:
     """
-    Get major ASNs in a country using the routing-status endpoint.
-    
-    RIPE retired country-asns in 2025. We now use ris-asns which 
-    returns ASNs seen in BGP for a given country's prefix space.
+    Get the routed ASNs for a country via RIPEstat's country-asns endpoint
+    (this is the correct, live endpoint - it was NOT retired, contrary to
+    an earlier incorrect comment in this file).
+
+    country-asns returns a custom string format like:
+        "{AsnSingle(1234), AsnSingle(5678), ...}"
+    not a JSON array, so we parse it with a regex.
+
+    The endpoint gives no names or prefix counts, just the routed ASN list
+    (often 1000+ entries) - we enrich the first `max_to_enrich` with name
+    and prefix count via as-overview and announced-prefixes, then sort by
+    IPv4 prefix count descending so the biggest networks surface first.
     """
-    cc = country_code.upper()
+    import re
+    import asyncio as _asyncio
+
+    cc = country_code.lower()
     async with httpx.AsyncClient(timeout=TIMEOUT, headers=HEADERS) as client:
         resp = await client.get(
-            f"{BASE_URL}/ris-asns/data.json",
-            params={"list_asns": "true", "asn_types": "o", "resource": cc},
+            f"{BASE_URL}/country-asns/data.json",
+            params={"resource": cc, "lod": 1},
         )
         resp.raise_for_status()
         data = resp.json().get("data", {})
 
-    # ris-asns returns {"counts": {"originating": N}, "asns": {"originating": [...]}}
-    asn_list = (
-        data.get("asns", {}).get("originating", [])
-        or data.get("asns", {}).get("transiting", [])
-        or []
-    )
+    countries = data.get("countries", [])
+    if not countries:
+        return []
 
-    results = []
-    for entry in asn_list:
-        # entry can be just an int ASN, or a dict
-        if isinstance(entry, int):
-            results.append({
-                "asn":           f"AS{entry}",
-                "asn_int":       entry,
-                "name":          "unknown",
-                "ipv4_prefixes": 0,
-                "ipv6_prefixes": 0,
-            })
-        elif isinstance(entry, dict):
-            asn = entry.get("asn") or entry.get("id")
-            results.append({
-                "asn":           f"AS{asn}",
-                "asn_int":       int(asn),
-                "name":          entry.get("holder") or entry.get("name") or "unknown",
-                "ipv4_prefixes": entry.get("ipv4_prefixes") or entry.get("pfxs", {}).get("v4", 0),
-                "ipv6_prefixes": entry.get("ipv6_prefixes") or entry.get("pfxs", {}).get("v6", 0),
-            })
+    routed_raw = countries[0].get("routed", "")
+    asn_ints = [int(n) for n in re.findall(r"AsnSingle\((\d+)\)", routed_raw)]
 
-    return results[:30]
+    if not asn_ints:
+        return []
+
+    # Enrich a capped subset in parallel - enriching thousands of ASNs would be
+    # far too slow and is unnecessary since we only need the top N by size anyway.
+    # We take a larger sample than max_to_enrich because un-enriched order is
+    # arbitrary, then sort and trim after enrichment.
+    sample_size = min(len(asn_ints), max(max_to_enrich * 15, 400))
+    sample = asn_ints[:sample_size]
+
+    semaphore = _asyncio.Semaphore(20)
+
+    async def enrich_one(asn_int: int) -> dict:
+        async with semaphore:
+            try:
+                overview, prefixes = await _asyncio.gather(
+                    get_asn_overview(asn_int),
+                    get_announced_prefixes(asn_int),
+                    return_exceptions=True,
+                )
+                name = overview.get("name", "unknown") if isinstance(overview, dict) else "unknown"
+                ipv4 = prefixes.get("ipv4_count", 0) if isinstance(prefixes, dict) else 0
+                ipv6 = prefixes.get("ipv6_count", 0) if isinstance(prefixes, dict) else 0
+            except Exception:
+                name, ipv4, ipv6 = "unknown", 0, 0
+            return {
+                "asn":           f"AS{asn_int}",
+                "asn_int":       asn_int,
+                "name":          name,
+                "ipv4_prefixes": ipv4,
+                "ipv6_prefixes": ipv6,
+            }
+
+    enriched = await _asyncio.gather(*[enrich_one(a) for a in sample])
+    enriched.sort(key=lambda e: e["ipv4_prefixes"], reverse=True)
+
+    top = enriched[:max_to_enrich]
+    for entry in top:
+        entry["_total_routed_in_country"] = len(asn_ints)
+        entry["_sampled_count"] = len(sample)
+
+    return top

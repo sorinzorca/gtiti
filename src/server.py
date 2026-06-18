@@ -19,7 +19,7 @@ from src.tools.briefing import build_full_briefing
 from src.connectors.news import get_operator_news
 from src.connectors.crunchbase import get_company_intelligence
 from src.connectors.submarine import get_operator_cables, get_cables_by_country
-from src.connectors.contacts import get_wholesale_contacts
+from src.connectors.contacts import get_wholesale_contacts, get_executive_and_commercial_contacts
 from src.connectors.bgp_tools import get_asn_classification
 from src.connectors.caida import get_as_rank, get_as_relationships
 from src.connectors.cloudflare_radar import get_radar_profile
@@ -68,6 +68,11 @@ async def list_tools() -> list[types.Tool]:
             name="gtiti_wholesale_contacts",
             description="Find wholesale, peering, and carrier-relations contacts for a telecom operator beyond what PeeringDB provides. Use this when asked: 'Who is the VP of Wholesale at Telefónica Brasil?', 'LinkedIn contacts at Tele2 Sweden', 'peering team at NTT'.",
             inputSchema={"type": "object", "properties": {"company_name": {"type": "string", "description": "Company name. Examples: 'Tele2 Sweden', 'Telefónica Brasil'"}, "roles": {"type": "array", "items": {"type": "string"}, "description": "Optional list of title keywords. Defaults to: VP Wholesale, Head of Peering, Carrier Relations, Director International."}}, "required": ["company_name"]},
+        ),
+        types.Tool(
+            name="gtiti_executive_contacts",
+            description="Find LinkedIn profile links for an operator's key people: CEO, CTO, COO (executive leadership) and VP Wholesale, Head of Peering, Carrier Relations, B2B leadership (commercial/technical decision-makers). Always returns clickable LinkedIn search links or live profile URLs - never imports or reproduces LinkedIn content directly. Use this when asked: 'who is the CEO of Tele2?', 'find the CTO and wholesale contacts for Deutsche Telekom', 'LinkedIn links for NTT's leadership and B2B team'.",
+            inputSchema={"type": "object", "properties": {"company_name": {"type": "string", "description": "Company name. Examples: 'Tele2 Sweden', 'Deutsche Telekom'"}, "include_executives": {"type": "boolean", "description": "Include CEO/CTO/COO search. Default true.", "default": True}, "include_b2b": {"type": "boolean", "description": "Include VP Wholesale/Peering/B2B search. Default true.", "default": True}}, "required": ["company_name"]},
         ),
         types.Tool(
             name="gtiti_bgp_classification",
@@ -164,6 +169,13 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             if not company_name:
                 raise ValueError("'company_name' parameter is required.")
             result = await get_wholesale_contacts(company_name, roles=arguments.get("roles", None))
+        elif name == "gtiti_executive_contacts":
+            company_name = arguments.get("company_name", "").strip()
+            if not company_name:
+                raise ValueError("'company_name' parameter is required.")
+            include_executives = arguments.get("include_executives", True)
+            include_b2b = arguments.get("include_b2b", True)
+            result = await get_executive_and_commercial_contacts(company_name, include_executives=include_executives, include_b2b=include_b2b)
         elif name == "gtiti_bgp_classification":
             asn = arguments.get("asn", "").strip()
             if not asn:
@@ -235,24 +247,29 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             prefixes = phase1_result.get("sample_prefixes_ipv4", [])
             website = phase1_result.get("website", "")
             if primary_asn:
-                bgp_classification, as_rank, radar_profile, routing_history, security_exposure, ixpdb_presence, domain_intel = await asyncio.gather(
+                bgp_classification, as_rank, as_relationships, radar_profile, routing_history, security_exposure, ixpdb_presence, domain_intel, prefix_ownership = await asyncio.gather(
                     get_asn_classification(primary_asn),
                     get_as_rank(primary_asn),
+                    get_as_relationships(primary_asn),
                     get_radar_profile(primary_asn),
                     get_routing_history(primary_asn),
                     check_exposure(prefixes),
                     get_ixpdb_presence(primary_asn),
                     get_domain_intelligence(website) if website else asyncio.sleep(0, result={"error": "No website found for this operator."}),
+                    verify_prefix_ownership(prefixes, expected_org_keyword=operator_name.split()[0] if operator_name else None),
                 )
             else:
                 bgp_classification = {"error": "No primary ASN found for this operator."}
                 as_rank = {"error": "No primary ASN found for this operator."}
+                as_relationships = {"error": "No primary ASN found for this operator."}
                 radar_profile = {"error": "No primary ASN found for this operator."}
                 routing_history = {"error": "No primary ASN found for this operator."}
                 security_exposure = {"error": "No primary ASN found for this operator."}
                 ixpdb_presence = {"error": "No primary ASN found for this operator."}
                 domain_intel = {"error": "No primary ASN found for this operator."}
-            result = {"operator": operator_name, "network_data": phase1_result, "bgp_classification": bgp_classification, "as_rank": as_rank, "cloudflare_radar": radar_profile, "routing_history": routing_history, "security_exposure": security_exposure, "ixpdb_cross_check": ixpdb_presence, "domain_intelligence": domain_intel, **phase2_result}
+                prefix_ownership = {"error": "No primary ASN found for this operator."}
+            exec_contacts = await get_executive_and_commercial_contacts(operator_name)
+            result = {"operator": operator_name, "network_data": phase1_result, "bgp_classification": bgp_classification, "as_rank": as_rank, "as_relationships": as_relationships, "cloudflare_radar": radar_profile, "routing_history": routing_history, "security_exposure": security_exposure, "ixpdb_cross_check": ixpdb_presence, "domain_intelligence": domain_intel, "prefix_ownership_verification": prefix_ownership, "executive_and_commercial_contacts": exec_contacts, **phase2_result}
         else:
             result = {"status": "error", "message": f"Unknown tool: '{name}'."}
     except Exception as e:

@@ -222,6 +222,7 @@ async def operators_in_country(country_code: str, top_n: int = 10) -> dict:
             "country": country_code,
         }
 
+    true_total_routed = country_asns[0].get("_total_routed_in_country", len(country_asns)) if country_asns else 0
     top_asns = country_asns[:top_n]
 
     async def enrich_asn(asn_entry: dict) -> dict:
@@ -250,12 +251,17 @@ async def operators_in_country(country_code: str, top_n: int = 10) -> dict:
     return {
         "status":            "ok",
         "country":           country_code.upper(),
-        "total_asns_routed": len(country_asns),
+        "total_asns_routed": true_total_routed,
         "operators":         list(enriched),
         "data_sources":      ["RIPE NCC RIPEstat", "PeeringDB"],
         "note": (
-            f"Showing top {len(enriched)} networks by IPv4 prefix count. "
-            f"Prefix count approximates network size but is not exact."
+            f"Showing top {len(enriched)} networks by IPv4 prefix count, sampled from "
+            f"{true_total_routed} routed ASNs in {country_code.upper()}. "
+            f"IMPORTANT CAVEAT: RIPEstat's country-asns list is not sorted by size, "
+            f"and only a bounded sample is enriched for speed - very large countries "
+            f"may have bigger operators outside the sampled range that aren't shown here. "
+            f"For a definitive answer on a specific known operator, use gtiti_operator_lookup "
+            f"with the operator's name directly instead."
         ),
     }
 
