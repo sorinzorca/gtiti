@@ -27,11 +27,18 @@ async def _google_linkedin_search(company_name, title_keyword):
                 async with s.get("https://serpapi.com/search", params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
                     r.raise_for_status()
                     data = await r.json()
-            return [{"name": item.get("title","").split(" - ")[0].strip(), "title": item.get("title",""), "linkedin_url": item.get("link",""), "snippet": item.get("snippet",""), "source": "SerpAPI → LinkedIn"} for item in data.get("organic_results",[])[:4]]
+            results = [{"name": item.get("title","").split(" - ")[0].strip(), "title": item.get("title",""), "linkedin_url": item.get("link",""), "snippet": item.get("snippet",""), "source": "SerpAPI -> LinkedIn (direct profile link)"} for item in data.get("organic_results",[])[:4]]
+            # Only return SerpAPI results if they actually resolved to linkedin.com/in/ URLs
+            results = [r for r in results if "linkedin.com/in/" in r.get("linkedin_url", "")]
+            if results:
+                return results
         except Exception:
             pass
-    search_url = f"https://www.google.com/search?q={quote(query)}"
-    return [{"name": "(click to search manually)", "title": title_keyword, "linkedin_url": search_url, "snippet": f"Google → LinkedIn search for {title_keyword} at {company_name}", "source": "Manual search URL"}]
+    # Fallback: LinkedIn's own public people-search URL, no key needed.
+    # This goes directly into LinkedIn's search results, not a Google detour.
+    linkedin_keywords = quote(f'{company_name} {title_keyword}')
+    search_url = f"https://www.linkedin.com/search/results/people/?keywords={linkedin_keywords}"
+    return [{"name": "(open LinkedIn search results)", "title": title_keyword, "linkedin_url": search_url, "snippet": f"Direct LinkedIn people-search for '{title_keyword}' at {company_name}", "source": "LinkedIn people search (no key needed)"}]
 
 async def get_wholesale_contacts(company_name, roles=None):
     if roles is None:
@@ -58,3 +65,66 @@ async def get_wholesale_contacts(company_name, roles=None):
         method = "SerpAPI → LinkedIn search results" if SERPAPI_KEY else "Pre-built Google search URLs (no API key)"
     note = "" if RAPIDAPI_KEY else "For live LinkedIn profiles add RAPIDAPI_KEY to .env. The URLs above are ready to click."
     return {"company": company_name, "contacts": contacts, "contact_count": len(contacts), "method": method, "note": note}
+
+
+_EXECUTIVE_ROLES = ["CEO", "Chief Executive Officer", "CTO", "Chief Technology Officer", "COO", "Chief Operating Officer"]
+_B2B_ROLES = ["VP Wholesale", "Head of Peering", "Carrier Relations", "Director International", "VP B2B", "Head of B2B", "B2B Sales Director"]
+
+
+async def get_executive_and_commercial_contacts(company_name, include_executives=True, include_b2b=True):
+    """
+    Find CEO/CTO/COO and B2B/wholesale/peering contacts for a company.
+    Always returns clickable LinkedIn search links or live profile URLs -
+    never imports or reproduces LinkedIn profile content directly.
+    """
+    roles = []
+    if include_executives:
+        roles += _EXECUTIVE_ROLES
+    if include_b2b:
+        roles += _B2B_ROLES
+
+    if not roles:
+        return {"company": company_name, "contacts": [], "contact_count": 0, "method": "none", "note": "Both include_executives and include_b2b were false."}
+
+    contacts = []
+
+    if RAPIDAPI_KEY:
+        results = await asyncio.gather(*[_rapidapi_search(company_name, role) for role in roles], return_exceptions=True)
+        for r in results:
+            if isinstance(r, list):
+                contacts.extend(r)
+        seen, deduped = set(), []
+        for c in contacts:
+            key = c.get("linkedin_url", "")
+            if key and key not in seen:
+                seen.add(key)
+                deduped.append(c)
+        contacts = deduped
+        method = "RapidAPI LinkedIn (live profiles)"
+    else:
+        # Cap at 8 role searches to avoid excessive parallel calls when both groups are included
+        results = await asyncio.gather(*[_google_linkedin_search(company_name, role) for role in roles[:8]], return_exceptions=True)
+        for r in results:
+            if isinstance(r, list):
+                contacts.extend(r)
+        method = "SerpAPI -> LinkedIn search results" if SERPAPI_KEY else "Pre-built Google search URLs (no API key)"
+
+    # Tag each contact with which category it was searched under, for easier grouping by the caller
+    for c in contacts:
+        role_searched = c.get("title", "")
+        if any(r.lower() in role_searched.lower() for r in ["ceo", "chief executive", "cto", "chief technology", "coo", "chief operating"]):
+            c["category"] = "executive"
+        else:
+            c["category"] = "b2b_wholesale"
+
+    note = "" if RAPIDAPI_KEY else "All results are clickable LinkedIn search links, not imported profile data. For live resolved profiles, add RAPIDAPI_KEY to .env."
+
+    return {
+        "company": company_name,
+        "contacts": contacts,
+        "contact_count": len(contacts),
+        "executive_contacts": [c for c in contacts if c.get("category") == "executive"],
+        "b2b_wholesale_contacts": [c for c in contacts if c.get("category") == "b2b_wholesale"],
+        "method": method,
+        "note": note,
+    }
