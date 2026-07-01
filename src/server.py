@@ -268,7 +268,10 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 ixpdb_presence = {"error": "No primary ASN found for this operator."}
                 domain_intel = {"error": "No primary ASN found for this operator."}
                 prefix_ownership = {"error": "No primary ASN found for this operator."}
-            exec_contacts = await get_executive_and_commercial_contacts(operator_name)
+            # Use the resolved operator name from PeeringDB rather than the raw query
+            # (which might be an ASN string like "AS8708" if Claude substituted it)
+            resolved_name = phase1_result.get("name", operator_name)
+            exec_contacts = await get_executive_and_commercial_contacts(resolved_name)
             result = {"operator": operator_name, "network_data": phase1_result, "bgp_classification": bgp_classification, "as_rank": as_rank, "as_relationships": as_relationships, "cloudflare_radar": radar_profile, "routing_history": routing_history, "security_exposure": security_exposure, "ixpdb_cross_check": ixpdb_presence, "domain_intelligence": domain_intel, "prefix_ownership_verification": prefix_ownership, "executive_and_commercial_contacts": exec_contacts, **phase2_result}
         else:
             result = {"status": "error", "message": f"Unknown tool: '{name}'."}
