@@ -30,10 +30,54 @@ def _normalize(text: str) -> str:
     return text.strip()
 
 
-def _score_match(query: str, result: dict) -> int:
+# Country name → ISO code mapping for geographic disambiguation
+_COUNTRY_HINTS = {
+    "romania": "RO", "romanian": "RO",
+    "spain": "ES", "spanish": "ES",
+    "germany": "DE", "german": "DE",
+    "france": "FR", "french": "FR",
+    "italy": "IT", "italian": "IT",
+    "netherlands": "NL", "dutch": "NL",
+    "sweden": "SE", "swedish": "SE",
+    "norway": "NO", "norwegian": "NO",
+    "denmark": "DK", "danish": "DK",
+    "finland": "FI", "finnish": "FI",
+    "poland": "PL", "polish": "PL",
+    "hungary": "HU", "hungarian": "HU",
+    "portugal": "PT", "portuguese": "PT",
+    "brazil": "BR", "brazilian": "BR",
+    "nigeria": "NG", "nigerian": "NG",
+    "japan": "JP", "japanese": "JP",
+    "india": "IN", "indian": "IN",
+    "uk": "GB", "united kingdom": "GB", "britain": "GB", "british": "GB",
+    "us": "US", "usa": "US", "united states": "US", "american": "US",
+    "australia": "AU", "australian": "AU",
+    "canada": "CA", "canadian": "CA",
+    "china": "CN", "chinese": "CN",
+    "singapore": "SG",
+    "south africa": "ZA",
+}
+
+def _extract_country_hint(query: str) -> str | None:
+    """Extract a country ISO code from a query string, if any country name is present."""
+    q_lower = query.lower()
+    # Check multi-word country names first (e.g. "united kingdom" before "kingdom")
+    for name, iso in sorted(_COUNTRY_HINTS.items(), key=lambda x: -len(x[0])):
+        if name in q_lower:
+            return iso
+    # Also check bare 2-letter ISO codes at word boundaries (e.g. "DIGI RO")
+    import re as _re
+    m = _re.search(r"\b([A-Z]{2})\b", query)
+    if m and m.group(1) in set(_COUNTRY_HINTS.values()):
+        return m.group(1)
+    return None
+
+
+def _score_match(query: str, result: dict, country_hint: str | None = None) -> int:
     """
     Score a PeeringDB result against the query.
     Higher = better match. Used to pick the best result from the list.
+    Includes geographic boosting when a country hint is present in the query.
     """
     q = _normalize(query)
     name = _normalize(result.get("name", ""))
@@ -66,26 +110,55 @@ def _score_match(query: str, result: dict) -> int:
     if not overlap_name and not overlap_aka:
         score -= 30
 
+    # Geographic boost: if the query mentions a country, prefer results
+    # whose name/aka contains the country ISO code or country name
+    if country_hint:
+        name_raw = (result.get("name", "") + " " + result.get("aka", "")).upper()
+        scope = result.get("info_scope", "").upper()
+        if country_hint in name_raw:
+            score += 60
+        # info_scope is continent-level (e.g. "Europe") not country-specific,
+        # but it's still a weak signal - don't use it for boosting, only for
+        # penalizing clearly wrong-continent results in future if needed
+
+    # Penalize for missing significant query words — if query has multiple words
+    # but only some appear in the name, the missing ones are a negative signal.
+    # This catches "RCS RDS" matching "RCS Networks" (RDS is missing entirely).
+    _GENERIC = {"networks", "communications", "telecom", "telecommunications",
+                "internet", "services", "systems", "technology", "technologies",
+                "group", "global", "international", "solutions", "holdings"}
+    significant_q_words = q_words - _GENERIC
+    if len(significant_q_words) > 1:
+        missing = significant_q_words - name_words - aka_words
+        score -= len(missing) * 25
+
     return score
 
 
-def _best_match(query: str, results: list[dict]) -> dict:
+def _best_match(query: str, results: list[dict]) -> tuple[dict, list[dict]]:
     """
-    Return the result that best matches the query by name similarity.
+    Return (best_match, alternative_candidates) where alternatives are other
+    results with similar scores that could be the intended target.
     Falls back to index 0 if nothing scores positively.
     """
     # If query looks like an ASN (AS1257, 1257), trust PeeringDB ordering
     if re.match(r"^(as)?\d+$", query.strip(), re.IGNORECASE):
-        return results[0]
+        return results[0], []
 
-    scored = [(r, _score_match(query, r)) for r in results]
+    country_hint = _extract_country_hint(query)
+    scored = [(r, _score_match(query, r, country_hint=country_hint)) for r in results]
     scored.sort(key=lambda x: x[1], reverse=True)
 
     best, best_score = scored[0]
 
-    # If best score is very low, nothing really matched — still return it
-    # but the caller will surface other_matches so the user can correct
-    return best
+    # Surface alternatives: other results within 30 points of the best score
+    # These are candidates the user might have intended instead
+    alternatives = [
+        r for r, s in scored[1:]
+        if s >= best_score - 30 and r.get("peeringdb_id") != best.get("peeringdb_id")
+    ][:3]  # cap at 3 alternatives
+
+    return best, alternatives
 
 
 # ── Tool: Look up a single operator ───────────────────────────────────────
@@ -123,9 +196,15 @@ async def lookup_operator(query: str) -> dict:
         }
 
     # Pick the best match by name similarity instead of blindly taking index 0
-    best_match  = _best_match(query, pdb_results)
+    best_match, alternative_matches = _best_match(query, pdb_results)
     pdb_id      = best_match["peeringdb_id"]
     primary_asn = best_match["asn"]
+
+    # Detect low-confidence matches — when the best score is very low,
+    # we likely matched something wrong rather than the intended operator.
+    country_hint = _extract_country_hint(query)
+    best_score = _score_match(query, best_match, country_hint=country_hint)
+    low_confidence = best_score < 30
 
     # ── Step 2: Fire all enrichment calls IN PARALLEL ──────────────────────
     pdb_detail_task    = peeringdb.get_network_details(pdb_id)
@@ -193,12 +272,23 @@ async def lookup_operator(query: str) -> dict:
         "upstreams":   ripe_upstreams.get("upstreams", []),
         "peers_count": len(ripe_upstreams.get("peers", [])),
 
-        # Other matches — so user can see alternatives if the pick was wrong
-        "other_matches": [
-            {"name": r["name"], "asn": r["asn"], "type": r["type"]}
-            for r in pdb_results
-            if r["peeringdb_id"] != pdb_id
-        ][:4],
+        # Disambiguation — alternatives with similar scores to the selected match
+        "disambiguation_warning": (
+            f"LOW CONFIDENCE MATCH: '{query}' did not match any network name clearly. "
+            f"Returned '{best_match['name']}' (AS{primary_asn}) as the closest result, "
+            f"but this is likely wrong. Try querying by ASN directly (e.g. 'AS8708') "
+            f"or use the official PeeringDB network name."
+            if low_confidence else (
+            f"Multiple similarly-named networks found. Matched '{best_match['name']}' "
+            f"(AS{primary_asn}). If this is wrong, try querying by ASN directly "
+            f"or include the country name (e.g. 'DIGI Romania')."
+            if alternative_matches else None
+            )
+        ),
+        "alternative_matches": [
+            {"name": r["name"], "asn": r["asn"], "type": r.get("type", "")}
+            for r in alternative_matches
+        ],
 
         # Source links
         "peeringdb_url": pdb_detail.get("peeringdb_url", ""),
