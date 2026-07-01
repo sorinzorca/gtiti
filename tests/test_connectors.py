@@ -162,6 +162,25 @@ async def test_country_operators_deterministic():
     ok(f"Same top-5 for Germany on both runs: {names1}")
 
 
+async def test_submarine_matching_no_short_string_false_positives():
+    header("Submarine matching: pure unit checks against the 'e&'/'digi' false-positive bugs")
+    cases = [
+        ("Tele2 Sweden", "TDC Group, Tele2", True),
+        ("Tele2 Sweden", "Tele2, Tet", True),
+        ("Tele2 Sweden", "G42, Mobily, TeleYemen, e&", False),
+        ("Tele2 Sweden", "Ooredoo, e&", False),
+        ("DIGI Romania", "Digicel", False),
+        ("DIGI Romania", "BW Digital", False),
+        ("DIGI Romania", "Valencia Digital Port Connect", False),
+        ("DIGI Romania", "RCS & RDS", True),
+        ("GlobalConnect", "GlobalConnect", True),
+    ]
+    for operator, owners, expected in cases:
+        got = submarine._operator_matches(operator, owners)
+        assert got == expected, f"{operator!r} vs {owners!r} -> {got}, expected {expected}"
+    ok(f"All {len(cases)} matching cases behave correctly")
+
+
 async def test_submarine_country_lookup():
     header("Submarine cables: cables landing in Sweden")
     result = await submarine.get_cables_by_country("Sweden")
@@ -182,13 +201,34 @@ async def test_submarine_operator_with_known_cables():
         info(f"  e.g. {result['cable_memberships'][0]['cable_name']}")
 
 
-async def test_submarine_operator_graceful_no_match():
-    header("Submarine cables: operator with no direct cable ownership (Tele2 Sweden)")
+async def test_submarine_operator_tele2_real_matches_only():
+    header("Submarine cables: Tele2 Sweden's real memberships (regression for the 'e&' false-positive bug)")
     result = await submarine.get_operator_cables("Tele2 Sweden")
+    assert "error" not in result, f"Unexpected error: {result.get('error')}"
+    names = {m["cable_name"] for m in result["cable_memberships"]}
+    ok(f"Tele2 Sweden cable memberships: {sorted(names)}")
+    # Tele2 genuinely co-owns these two short Baltic Sea links (both list "Tele2"
+    # directly in TeleGeography's owners field) - these should always match.
+    assert "Denmark-Sweden 17" in names, "Tele2 is a real co-owner of Denmark-Sweden 17"
+    assert "Latvia-Sweden 1 (LV-SE 1)" in names, "Tele2 is a real co-owner of Latvia-Sweden 1"
+    # These previously false-positived because "e&" (Etisalat's rebrand) normalizes
+    # to a single character that's trivially "contained in" almost anything.
+    false_positive_cables = {"Africa-1", "Asia Africa Europe-1 (AAE-1)", "Qatar-U.A.E. Submarine Cable System"}
+    assert not (names & false_positive_cables), f"False-positive 'e&' matches leaked back in: {names & false_positive_cables}"
+    ok("No 'e&' false positives leaked through")
+
+
+async def test_submarine_operator_digi_romania_no_false_positives():
+    header("Submarine cables: DIGI Romania (regression for the bare-'digi'-alias false-positive bug)")
+    result = await submarine.get_operator_cables("DIGI Romania")
     assert "error" not in result, f"Should not error, got: {result.get('error')}"
-    assert result["total_cables"] == 0
-    assert "note" in result, "Should explain that most retail operators lease rather than own capacity"
-    ok("Handled gracefully with an explanatory note (not an error)")
+    names = {m["cable_name"] for m in result["cable_memberships"]}
+    # These previously false-positived because the bare "digi" alias substring-matched
+    # into any unrelated company name containing "digi" (Digicel, BW Digital, etc.)
+    false_positive_owners = {"Digicel", "BW Digital", "Valencia Digital Port Connect"}
+    for m in result["cable_memberships"]:
+        assert not (set(m["all_owners"]) & false_positive_owners), f"'{m['cable_name']}' is a false positive (owners: {m['all_owners']})"
+    ok(f"DIGI Romania: {result['total_cables']} memberships, none are Digicel/BW Digital/etc false positives")
 
 
 async def test_caida_as_relationships_parallel_pagination():
@@ -251,9 +291,11 @@ async def run_all():
         ("Full operator lookup",     test_full_operator_lookup),
         ("Country operators",        test_country_operators),
         ("Country operators: deterministic", test_country_operators_deterministic),
+        ("Submarine: matching unit checks", test_submarine_matching_no_short_string_false_positives),
         ("Submarine: country lookup", test_submarine_country_lookup),
         ("Submarine: known operator", test_submarine_operator_with_known_cables),
-        ("Submarine: graceful no-match", test_submarine_operator_graceful_no_match),
+        ("Submarine: Tele2 real matches only", test_submarine_operator_tele2_real_matches_only),
+        ("Submarine: DIGI Romania no false positives", test_submarine_operator_digi_romania_no_false_positives),
         ("CAIDA: parallel pagination", test_caida_as_relationships_parallel_pagination),
         ("Cloudflare Radar: concurrent calls", test_cloudflare_radar_concurrent_calls),
         ("Full briefing: fast mode",  test_full_briefing_fast_mode),

@@ -57,8 +57,31 @@ _FETCH_CONCURRENCY = 20
 # _norm). Add entries here as you discover mismatches.
 _ALIASES = {
     "tele2 sweden": ["tele2"],
-    "digi romania": ["digi communications", "rcs rds", "rcsrds", "digi"],
+    # NOTE: deliberately NOT including a bare "digi" alias here — it's short
+    # enough to substring-match into unrelated real owner names (Digicel, BW
+    # Digital, Valencia Digital Port Connect, BR.Digital Telecom all matched
+    # before this was caught). Keep aliases specific enough that they can't
+    # collide with a different real company's name.
+    "digi romania": ["digi communications", "rcs rds", "rcsrds"],
 }
+
+# Minimum length (after normalization) for either side of a fuzzy substring
+# match. Without this, a short degenerate owner name — e.g. "e&" (Etisalat's
+# rebrand) normalizes to a single character "e" — trivially substring-matches
+# into almost any candidate ("e" is "in" "tele2"), causing every cable
+# co-owned by a short-named company to false-positive against everything.
+# Exact-equality matches are always allowed regardless of length.
+_MIN_FUZZY_MATCH_LEN = 4
+
+
+def _fuzzy_contains(candidate, owner_norm):
+    if not candidate or not owner_norm:
+        return False
+    if candidate == owner_norm:
+        return True
+    if len(candidate) < _MIN_FUZZY_MATCH_LEN or len(owner_norm) < _MIN_FUZZY_MATCH_LEN:
+        return False
+    return candidate in owner_norm or owner_norm in candidate
 
 
 def _norm(name):
@@ -85,7 +108,7 @@ def _operator_matches(operator_name, owners_field):
         if not owner_norm:
             continue
         for candidate in candidates:
-            if candidate and (candidate in owner_norm or owner_norm in candidate):
+            if _fuzzy_contains(candidate, owner_norm):
                 return True
         if len(needle_words) <= 2 and needle_words.issubset(set(owner_norm.split())):
             return True
