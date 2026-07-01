@@ -260,6 +260,12 @@ async def lookup_operator(query: str) -> dict:
         # IXP presence
         "ixp_count":    len(pdb_detail.get("ixp_presence", [])),
         "ixp_presence": pdb_detail.get("ixp_presence", []),
+        "ixp_note": (
+            "No IXP LAN entries found in PeeringDB. This may reflect stale or missing "
+            "PeeringDB records rather than actual absence from exchanges. "
+            "Use gtiti_ixpdb_lookup for an independent cross-check via Euro-IX."
+            if not pdb_detail.get("ixp_presence") else None
+        ),
 
         # Contacts
         "contacts": pdb_detail.get("contacts", []),
