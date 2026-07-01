@@ -67,13 +67,14 @@ async def get_wholesale_contacts(company_name, roles=None):
     return {"company": company_name, "contacts": contacts, "contact_count": len(contacts), "method": method, "note": note}
 
 
-_EXECUTIVE_ROLES = ["CEO", "Chief Executive Officer", "CTO", "Chief Technology Officer", "COO", "Chief Operating Officer"]
-_B2B_ROLES = ["VP Wholesale", "Head of Peering", "Carrier Relations", "Director International", "VP B2B", "Head of B2B", "B2B Sales Director"]
+_EXECUTIVE_ROLES = ["CEO", "CTO", "COO"]
+_B2B_ROLES = ["VP Wholesale", "Head of Peering", "Carrier Relations", "Director International"]
+_COMPLIANCE_ROLES = ["CISO", "DPO", "Head of Compliance", "Head of Legal", "Compliance Officer", "Head of Cybersecurity"]
 
 
-async def get_executive_and_commercial_contacts(company_name, include_executives=True, include_b2b=True):
+async def get_executive_and_commercial_contacts(company_name, include_executives=True, include_b2b=True, include_compliance=True):
     """
-    Find CEO/CTO/COO and B2B/wholesale/peering contacts for a company.
+    Find CEO/CTO/COO, B2B/wholesale/peering, and compliance/security contacts for a company.
     Always returns clickable LinkedIn search links or live profile URLs -
     never imports or reproduces LinkedIn profile content directly.
     """
@@ -82,6 +83,8 @@ async def get_executive_and_commercial_contacts(company_name, include_executives
         roles += _EXECUTIVE_ROLES
     if include_b2b:
         roles += _B2B_ROLES
+    if include_compliance:
+        roles += _COMPLIANCE_ROLES
 
     if not roles:
         return {"company": company_name, "contacts": [], "contact_count": 0, "method": "none", "note": "Both include_executives and include_b2b were false."}
@@ -103,17 +106,20 @@ async def get_executive_and_commercial_contacts(company_name, include_executives
         method = "RapidAPI LinkedIn (live profiles)"
     else:
         # Cap at 8 role searches to avoid excessive parallel calls when both groups are included
-        results = await asyncio.gather(*[_google_linkedin_search(company_name, role) for role in roles[:8]], return_exceptions=True)
+        results = await asyncio.gather(*[_google_linkedin_search(company_name, role) for role in roles[:15]], return_exceptions=True)
         for r in results:
             if isinstance(r, list):
                 contacts.extend(r)
         method = "SerpAPI -> LinkedIn search results" if SERPAPI_KEY else "Pre-built Google search URLs (no API key)"
 
     # Tag each contact with which category it was searched under, for easier grouping by the caller
+    _COMPLIANCE_KEYWORDS = ["ciso", "dpo", "compliance", "legal", "cybersecurity", "information security", "data protection"]
     for c in contacts:
-        role_searched = c.get("title", "")
-        if any(r.lower() in role_searched.lower() for r in ["ceo", "chief executive", "cto", "chief technology", "coo", "chief operating"]):
+        role_searched = c.get("title", "").lower()
+        if any(r in role_searched for r in ["ceo", "chief executive", "cto", "chief technology", "coo", "chief operating"]):
             c["category"] = "executive"
+        elif any(r in role_searched for r in _COMPLIANCE_KEYWORDS):
+            c["category"] = "compliance_security"
         else:
             c["category"] = "b2b_wholesale"
 
@@ -125,6 +131,7 @@ async def get_executive_and_commercial_contacts(company_name, include_executives
         "contact_count": len(contacts),
         "executive_contacts": [c for c in contacts if c.get("category") == "executive"],
         "b2b_wholesale_contacts": [c for c in contacts if c.get("category") == "b2b_wholesale"],
+        "compliance_security_contacts": [c for c in contacts if c.get("category") == "compliance_security"],
         "method": method,
         "note": note,
     }
