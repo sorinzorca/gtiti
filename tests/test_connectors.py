@@ -22,8 +22,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-from src.connectors import peeringdb, ripe
+from src.connectors import peeringdb, ripe, submarine, caida, cloudflare_radar
 from src.tools.operator import lookup_operator, operators_in_country
+from src.tools.briefing import build_full_briefing
 
 
 # ── Colour helpers for terminal output ────────────────────────────────────
@@ -137,14 +138,88 @@ async def test_full_operator_lookup():
 
 
 async def test_country_operators():
-    header("Country operators: Brazil (BR)")
+    header("Country operators: Brazil (BR) — now CAIDA rank-scan based")
     result = await operators_in_country("BR", top_n=5)
     assert result["status"] == "ok"
     ops = result.get("operators", [])
     ok(f"Top {len(ops)} operators in Brazil:")
     for op in ops:
         pdb = "✓ PeeringDB" if op.get("in_peeringdb") else "  no PeeringDB"
-        info(f"  {op['asn']:12}  {op['name'][:40]:40}  {pdb}")
+        info(f"  {op['asn']:12}  {op['name'][:40]:40}  rank={op.get('global_rank','?'):5}  {pdb}")
+    assert all("global_rank" in o for o in ops), "Expected CAIDA-sourced results with a global_rank field"
+    ranks = [o["global_rank"] for o in ops]
+    assert ranks == sorted(ranks), "Operators should be returned in ascending (best-first) rank order"
+    assert "CAIDA AS Rank" in result["data_sources"][0]
+
+
+async def test_country_operators_deterministic():
+    header("Country operators: same query twice should give identical results")
+    r1 = await operators_in_country("DE", top_n=5)
+    r2 = await operators_in_country("DE", top_n=5)
+    names1 = [o["name"] for o in r1["operators"]]
+    names2 = [o["name"] for o in r2["operators"]]
+    assert names1 == names2, "CAIDA rank-scan should be deterministic, unlike the old RIPEstat sampling"
+    ok(f"Same top-5 for Germany on both runs: {names1}")
+
+
+async def test_submarine_country_lookup():
+    header("Submarine cables: cables landing in Sweden")
+    result = await submarine.get_cables_by_country("Sweden")
+    assert "error" not in result, f"Unexpected error: {result.get('error')}"
+    ok(f"Found {result['total_cables']} cables landing in Sweden")
+    assert result["total_cables"] > 0, "Sweden should have several known cable landings (NordBalt, Baltic Sea Submarine Cable, etc.)"
+    for c in result["cables"][:3]:
+        info(f"  {c['cable_name']}  (owners: {', '.join(c['owners']) or 'unknown'})")
+
+
+async def test_submarine_operator_with_known_cables():
+    header("Submarine cables: operator with known real memberships (Telia)")
+    result = await submarine.get_operator_cables("Telia")
+    assert "error" not in result, f"Unexpected error: {result.get('error')}"
+    ok(f"Telia cable memberships: {result['total_cables']}")
+    assert result["total_cables"] > 0, "Telia is a known Nordic cable owner — should have at least one match"
+    if result["cable_memberships"]:
+        info(f"  e.g. {result['cable_memberships'][0]['cable_name']}")
+
+
+async def test_submarine_operator_graceful_no_match():
+    header("Submarine cables: operator with no direct cable ownership (Tele2 Sweden)")
+    result = await submarine.get_operator_cables("Tele2 Sweden")
+    assert "error" not in result, f"Should not error, got: {result.get('error')}"
+    assert result["total_cables"] == 0
+    assert "note" in result, "Should explain that most retail operators lease rather than own capacity"
+    ok("Handled gracefully with an explanatory note (not an error)")
+
+
+async def test_caida_as_relationships_parallel_pagination():
+    header("CAIDA: AS relationships for AS3320 (parallelized pagination)")
+    result = await caida.get_as_relationships(3320)
+    assert "error" not in result, f"Unexpected error: {result.get('error')}"
+    ok(f"Total relationships: {result['total_relationships']} (customers={result['customer_count']}, providers={result['provider_count']}, peers={result['peer_count']})")
+    assert result["total_relationships"] > 100, "AS3320 (Deutsche Telekom) should have well over 100 relationships"
+    assert result["customer_count"] + result["provider_count"] + len(result["peers"]) > 0
+
+
+async def test_cloudflare_radar_concurrent_calls():
+    header("Cloudflare Radar: concurrent profile fetch for AS3320")
+    result = await cloudflare_radar.get_radar_profile(3320)
+    if not result.get("available", True) and "CF_API_TOKEN" in result.get("message", ""):
+        info("CF_API_TOKEN not set — skipping (connector correctly reports unavailable)")
+        return
+    assert "error" not in result, f"Unexpected error: {result.get('error')}"
+    ok(f"RPKI valid_pct: {result['rpki_validation'].get('valid_pct')}")
+
+
+async def test_full_briefing_fast_mode():
+    header("Full briefing: fast=True skips submarine cables")
+    result = await build_full_briefing("Tele2", fast=True)
+    assert result["submarine_cables"].get("skipped") is True, "fast=True should skip submarine cable lookup"
+    ok("fast=True correctly skipped the submarine cable index build")
+
+    header("Full briefing: fast=False includes submarine cables")
+    result = await build_full_briefing("Tele2", fast=False)
+    assert "skipped" not in result["submarine_cables"], "fast=False should actually run the submarine cable lookup"
+    ok("fast=False correctly ran the submarine cable lookup")
 
 
 async def test_not_found():
@@ -175,6 +250,13 @@ async def run_all():
         ("RIPE country ASNs",        test_ripe_country),
         ("Full operator lookup",     test_full_operator_lookup),
         ("Country operators",        test_country_operators),
+        ("Country operators: deterministic", test_country_operators_deterministic),
+        ("Submarine: country lookup", test_submarine_country_lookup),
+        ("Submarine: known operator", test_submarine_operator_with_known_cables),
+        ("Submarine: graceful no-match", test_submarine_operator_graceful_no_match),
+        ("CAIDA: parallel pagination", test_caida_as_relationships_parallel_pagination),
+        ("Cloudflare Radar: concurrent calls", test_cloudflare_radar_concurrent_calls),
+        ("Full briefing: fast mode",  test_full_briefing_fast_mode),
         ("Not found handling",       test_not_found),
     ]
 

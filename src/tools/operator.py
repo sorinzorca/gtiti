@@ -18,6 +18,7 @@ from typing import Any
 
 from src.connectors import peeringdb
 from src.connectors import ripe
+from src.connectors import caida
 
 
 # ── Name disambiguation ────────────────────────────────────────────────────
@@ -304,9 +305,36 @@ async def lookup_operator(query: str) -> dict:
 
 # ── Tool: Look up operators in a country ──────────────────────────────────
 
-async def operators_in_country(country_code: str, top_n: int = 10) -> dict:
+async def _enrich_with_peeringdb(entries: list[dict]) -> list[dict]:
+    """Cross-check a bounded list of ASN entries against PeeringDB for peering
+    policy / PeeringDB ID, bounded concurrency so we don't hammer PeeringDB."""
+    semaphore = asyncio.Semaphore(5)
+
+    async def enrich_one(entry: dict) -> dict:
+        async with semaphore:
+            try:
+                pdb_results = await peeringdb.search_networks(str(entry["asn_int"]))
+                if pdb_results:
+                    pdb = pdb_results[0]
+                    return {
+                        **entry,
+                        "peering_policy": pdb.get("peering_policy", "unknown"),
+                        "peeringdb_id":   pdb.get("peeringdb_id"),
+                        "in_peeringdb":   True,
+                    }
+            except Exception:
+                pass
+            return {**entry, "in_peeringdb": False, "peering_policy": "unknown"}
+
+    return list(await asyncio.gather(*[enrich_one(e) for e in entries]))
+
+
+async def _operators_in_country_ripestat_fallback(country_code: str, top_n: int) -> dict:
     """
-    Find the most significant telecom operators in a given country.
+    Older approach, kept as a fallback for when CAIDA AS Rank is unreachable.
+    RIPEstat's country-asns list is NOT sorted by size — this enriches a
+    bounded sample and sorts by IPv4 prefix count after the fact, so very
+    large countries may have bigger operators outside the sampled range.
     """
     country_asns = await ripe.get_country_asns(country_code)
 
@@ -319,38 +347,16 @@ async def operators_in_country(country_code: str, top_n: int = 10) -> dict:
         }
 
     true_total_routed = country_asns[0].get("_total_routed_in_country", len(country_asns)) if country_asns else 0
-    top_asns = country_asns[:top_n]
-
-    async def enrich_asn(asn_entry: dict) -> dict:
-        try:
-            pdb_results = await peeringdb.search_networks(str(asn_entry["asn_int"]))
-            if pdb_results:
-                pdb = pdb_results[0]
-                return {
-                    **asn_entry,
-                    "peering_policy": pdb.get("peering_policy", "unknown"),
-                    "peeringdb_id":   pdb.get("peeringdb_id"),
-                    "in_peeringdb":   True,
-                }
-        except Exception:
-            pass
-        return {**asn_entry, "in_peeringdb": False, "peering_policy": "unknown"}
-
-    semaphore = asyncio.Semaphore(5)
-
-    async def guarded_enrich(asn_entry):
-        async with semaphore:
-            return await enrich_asn(asn_entry)
-
-    enriched = await asyncio.gather(*[guarded_enrich(a) for a in top_asns])
+    enriched = await _enrich_with_peeringdb(country_asns[:top_n])
 
     return {
         "status":            "ok",
         "country":           country_code.upper(),
         "total_asns_routed": true_total_routed,
-        "operators":         list(enriched),
+        "operators":         enriched,
         "data_sources":      ["RIPE NCC RIPEstat", "PeeringDB"],
         "note": (
+            f"CAIDA AS Rank was unreachable, so this fell back to RIPEstat sampling. "
             f"Showing top {len(enriched)} networks by IPv4 prefix count, sampled from "
             f"{true_total_routed} routed ASNs in {country_code.upper()}. "
             f"IMPORTANT CAVEAT: RIPEstat's country-asns list is not sorted by size, "
@@ -358,6 +364,67 @@ async def operators_in_country(country_code: str, top_n: int = 10) -> dict:
             f"may have bigger operators outside the sampled range that aren't shown here. "
             f"For a definitive answer on a specific known operator, use gtiti_operator_lookup "
             f"with the operator's name directly instead."
+        ),
+    }
+
+
+async def operators_in_country(country_code: str, top_n: int = 10) -> dict:
+    """
+    Find the most significant telecom operators in a given country, ranked by
+    CAIDA's global AS Rank (customer cone / transit degree significance).
+
+    CAIDA's bulk ASN query has no country filter, but it IS globally sorted
+    by rank by default (confirmed live against the schema), so we paginate
+    that rank-ordered list and keep whatever matches the target country. This
+    is deterministic and surfaces truly significant operators first, unlike
+    the old RIPEstat-sampling approach (kept as a fallback below) which drew
+    from an arbitrary-order ASN list and could miss bigger operators outside
+    the sampled range.
+
+    NOTE: this ranks by CAIDA's topological significance, not raw IPv4 prefix
+    count — a different (arguably more meaningful, for "important operator")
+    metric than what this tool used to report. See the "note" field.
+    """
+    country_code = country_code.upper()
+    caida_result = await caida.get_top_asns_by_country(country_code, top_n=top_n)
+
+    if caida_result.get("error"):
+        return await _operators_in_country_ripestat_fallback(country_code, top_n)
+
+    matches = caida_result.get("matches", [])
+    if not matches:
+        return {
+            "status":  "not_found",
+            "message": f"No ASNs found for country code '{country_code}' within CAIDA's top "
+                       f"{caida_result.get('scanned_globally_ranked_asns', 0)} globally-ranked ASNs. "
+                       f"Make sure you're using the 2-letter ISO code (DE, BR, JP...) — if the code is "
+                       f"correct, this country's operators may simply rank very low globally; try "
+                       f"gtiti_operator_lookup for a specific known operator instead.",
+            "country": country_code,
+        }
+
+    enriched = await _enrich_with_peeringdb(matches)
+
+    return {
+        "status":       "ok",
+        "country":      country_code,
+        "operators":    enriched,
+        "data_sources": ["CAIDA AS Rank (global rank-ordered scan)", "PeeringDB"],
+        "note": (
+            f"Ranked by CAIDA's global AS significance (customer cone size / transit degree), "
+            f"scanning the top {caida_result['scanned_globally_ranked_asns']} globally-ranked ASNs "
+            f"(out of {caida_result.get('total_asns_in_dataset', 'unknown')} total) and keeping the "
+            f"ones registered in {country_code}. This is deterministic, unlike the previous approach "
+            f"(arbitrary-order sampling from RIPEstat). METRIC CHANGE: this ranks by topological "
+            f"significance, not raw IPv4 prefix count — a content network with many small disaggregated "
+            f"prefixes may rank differently than before. For a definitive answer on a specific known "
+            f"operator, use gtiti_operator_lookup with the operator's name directly instead."
+        ),
+        "truncated_scan": caida_result.get("truncated_scan", False),
+        "truncated_scan_note": (
+            f"Only found {len(matches)} of the requested {top_n} within the scan limit — this country's "
+            f"lower-ranked operators may not be globally significant enough to appear in a bounded scan."
+            if caida_result.get("truncated_scan") else None
         ),
     }
 

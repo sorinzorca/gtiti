@@ -1,4 +1,5 @@
 import os
+import asyncio
 import aiohttp
 
 CF_API_TOKEN = os.getenv("CF_API_TOKEN", "")
@@ -37,20 +38,20 @@ async def get_radar_profile(asn):
             ),
         }
 
-    try:
-        routing_stats = await _cf_get("/radar/bgp/routes/stats", {"asn": asn_int})
-    except Exception as exc:
-        routing_stats = {"error": str(exc)}
-
-    try:
-        relationships = await _cf_get(f"/radar/entities/asns/{asn_int}/rel")
-    except Exception as exc:
-        relationships = {"error": str(exc)}
-
-    try:
-        asn_info = await _cf_get(f"/radar/entities/asns/{asn_int}")
-    except Exception as exc:
-        asn_info = {"error": str(exc)}
+    # These 3 calls are independent — fire them concurrently instead of one
+    # after another (was a purely sequential ~3x tax on every lookup).
+    routing_stats, relationships, asn_info = await asyncio.gather(
+        _cf_get("/radar/bgp/routes/stats", {"asn": asn_int}),
+        _cf_get(f"/radar/entities/asns/{asn_int}/rel"),
+        _cf_get(f"/radar/entities/asns/{asn_int}"),
+        return_exceptions=True,
+    )
+    if isinstance(routing_stats, Exception):
+        routing_stats = {"error": str(routing_stats)}
+    if isinstance(relationships, Exception):
+        relationships = {"error": str(relationships)}
+    if isinstance(asn_info, Exception):
+        asn_info = {"error": str(asn_info)}
 
     stats_result = routing_stats.get("result", {}).get("stats", {}) if isinstance(routing_stats, dict) and "result" in routing_stats else {}
     routes_total = stats_result.get("routes_total", 0)

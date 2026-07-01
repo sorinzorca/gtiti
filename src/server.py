@@ -121,8 +121,8 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="gtiti_full_briefing",
-            description="Generate a COMPLETE operator briefing combining ALL data sources: ASNs, IXP presence (PeeringDB + IXPDB cross-check), BGP prefixes, peering contacts, network classification, AS rank and customer cone, RPKI/routing security health, BGP routing history and anomalies, security exposure spot-check, domain/subdomain intelligence, recent news, Crunchbase financials, submarine cable memberships, and wholesale LinkedIn contacts. Use this when asked: 'Prepare a full briefing on Tele2 Sweden', 'I have a meeting with Deutsche Telekom, give me everything', 'complete profile of NTT Communications'.",
-            inputSchema={"type": "object", "properties": {"operator_name": {"type": "string", "description": "Operator name. Examples: 'Tele2 Sweden', 'Deutsche Telekom', 'NTT Communications'"}}, "required": ["operator_name"]},
+            description="Generate a COMPLETE operator briefing combining ALL data sources: ASNs, IXP presence (PeeringDB + IXPDB cross-check), BGP prefixes, peering contacts, network classification, AS rank and customer cone, RPKI/routing security health, BGP routing history and anomalies, security exposure spot-check, domain/subdomain intelligence, recent news, Crunchbase financials, submarine cable memberships, and wholesale LinkedIn contacts. Use this when asked: 'Prepare a full briefing on Tele2 Sweden', 'I have a meeting with Deutsche Telekom, give me everything', 'complete profile of NTT Communications'. Pass fast=true for a quicker version that skips submarine cables, BGP routing history, the Shodan security spot-check, IXPDB cross-check, and domain intelligence — useful when you just need the core identity/ASN/contacts picture in a hurry (e.g. 'quick briefing on Tele2 before my call in 5 minutes').",
+            inputSchema={"type": "object", "properties": {"operator_name": {"type": "string", "description": "Operator name. Examples: 'Tele2 Sweden', 'Deutsche Telekom', 'NTT Communications'"}, "fast": {"type": "boolean", "description": "Skip the slower/less-essential sections (submarine cables, routing history, security exposure spot-check, IXPDB cross-check, domain intelligence) for a much quicker result. Default false.", "default": False}}, "required": ["operator_name"]},
         ),
     ]
 
@@ -242,22 +242,44 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             operator_name = arguments.get("operator_name", "").strip()
             if not operator_name:
                 raise ValueError("'operator_name' parameter is required.")
-            phase1_result, phase2_result = await asyncio.gather(lookup_operator(operator_name), build_full_briefing(operator_name))
+            fast = bool(arguments.get("fast", False))
+            phase1_result, phase2_result = await asyncio.gather(lookup_operator(operator_name), build_full_briefing(operator_name, fast=fast))
             primary_asn = phase1_result.get("primary_asn", "")
             prefixes = phase1_result.get("sample_prefixes_ipv4", [])
             website = phase1_result.get("website", "")
+            # Use the resolved operator name from PeeringDB rather than the raw query
+            # (which might be an ASN string like "AS8708" if Claude substituted it).
+            # exec_contacts only depends on this, not on primary_asn, so it belongs
+            # in the same gather below instead of a serial call after it.
+            resolved_name = phase1_result.get("name", operator_name)
+            skipped_note = "Skipped in fast mode. Rerun gtiti_full_briefing with fast=False for the complete picture."
             if primary_asn:
-                bgp_classification, as_rank, as_relationships, radar_profile, routing_history, security_exposure, ixpdb_presence, domain_intel, prefix_ownership = await asyncio.gather(
-                    get_asn_classification(primary_asn),
-                    get_as_rank(primary_asn),
-                    get_as_relationships(primary_asn),
-                    get_radar_profile(primary_asn),
-                    get_routing_history(primary_asn),
-                    check_exposure(prefixes),
-                    get_ixpdb_presence(primary_asn),
-                    get_domain_intelligence(website) if website else asyncio.sleep(0, result={"error": "No website found for this operator."}),
-                    verify_prefix_ownership(prefixes, expected_org_keyword=operator_name.split()[0] if operator_name else None),
-                )
+                if fast:
+                    bgp_classification, as_rank, as_relationships, radar_profile, prefix_ownership, exec_contacts = await asyncio.gather(
+                        get_asn_classification(primary_asn),
+                        get_as_rank(primary_asn),
+                        get_as_relationships(primary_asn),
+                        get_radar_profile(primary_asn),
+                        verify_prefix_ownership(prefixes, expected_org_keyword=operator_name.split()[0] if operator_name else None),
+                        get_executive_and_commercial_contacts(resolved_name),
+                    )
+                    routing_history = {"skipped": True, "note": skipped_note}
+                    security_exposure = {"skipped": True, "note": skipped_note}
+                    ixpdb_presence = {"skipped": True, "note": skipped_note}
+                    domain_intel = {"skipped": True, "note": skipped_note}
+                else:
+                    bgp_classification, as_rank, as_relationships, radar_profile, routing_history, security_exposure, ixpdb_presence, domain_intel, prefix_ownership, exec_contacts = await asyncio.gather(
+                        get_asn_classification(primary_asn),
+                        get_as_rank(primary_asn),
+                        get_as_relationships(primary_asn),
+                        get_radar_profile(primary_asn),
+                        get_routing_history(primary_asn),
+                        check_exposure(prefixes),
+                        get_ixpdb_presence(primary_asn),
+                        get_domain_intelligence(website) if website else asyncio.sleep(0, result={"error": "No website found for this operator."}),
+                        verify_prefix_ownership(prefixes, expected_org_keyword=operator_name.split()[0] if operator_name else None),
+                        get_executive_and_commercial_contacts(resolved_name),
+                    )
             else:
                 bgp_classification = {"error": "No primary ASN found for this operator."}
                 as_rank = {"error": "No primary ASN found for this operator."}
@@ -268,11 +290,8 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 ixpdb_presence = {"error": "No primary ASN found for this operator."}
                 domain_intel = {"error": "No primary ASN found for this operator."}
                 prefix_ownership = {"error": "No primary ASN found for this operator."}
-            # Use the resolved operator name from PeeringDB rather than the raw query
-            # (which might be an ASN string like "AS8708" if Claude substituted it)
-            resolved_name = phase1_result.get("name", operator_name)
-            exec_contacts = await get_executive_and_commercial_contacts(resolved_name)
-            result = {"operator": operator_name, "network_data": phase1_result, "bgp_classification": bgp_classification, "as_rank": as_rank, "as_relationships": as_relationships, "cloudflare_radar": radar_profile, "routing_history": routing_history, "security_exposure": security_exposure, "ixpdb_cross_check": ixpdb_presence, "domain_intelligence": domain_intel, "prefix_ownership_verification": prefix_ownership, "executive_and_commercial_contacts": exec_contacts, **phase2_result}
+                exec_contacts = await get_executive_and_commercial_contacts(resolved_name)
+            result = {"operator": operator_name, "fast_mode": fast, "network_data": phase1_result, "bgp_classification": bgp_classification, "as_rank": as_rank, "as_relationships": as_relationships, "cloudflare_radar": radar_profile, "routing_history": routing_history, "security_exposure": security_exposure, "ixpdb_cross_check": ixpdb_presence, "domain_intelligence": domain_intel, "prefix_ownership_verification": prefix_ownership, "executive_and_commercial_contacts": exec_contacts, **phase2_result}
         else:
             result = {"status": "error", "message": f"Unknown tool: '{name}'."}
     except Exception as e:
