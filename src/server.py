@@ -21,6 +21,7 @@ from src.connectors.crunchbase import get_company_intelligence
 from src.connectors.submarine import get_operator_cables, get_cables_by_country
 from src.connectors.contacts import get_wholesale_contacts, get_executive_and_commercial_contacts
 from src.connectors.bgp_tools import get_asn_classification
+from src.connectors.bgp_he import get_bgp_he_lookup
 from src.connectors.caida import get_as_rank, get_as_relationships
 from src.connectors.cloudflare_radar import get_radar_profile
 from src.connectors.routing_history import get_routing_history
@@ -78,6 +79,11 @@ async def list_tools() -> list[types.Tool]:
             name="gtiti_bgp_classification",
             description="Classify a telecom operator's network type (Eyeball, Transit, Content, Enterprise, or Unknown) using bgp.tools, and cross-check the country, registry, and allocation date for the ASN via whois. Use this when asked: 'what type of network is AS1257?', 'is Cogent a transit network?', 'when was AS3320 allocated?'.",
             inputSchema={"type": "object", "properties": {"asn": {"type": "string", "description": "ASN as a number or 'AS' prefixed string. Examples: '1257', 'AS1257', 'AS3320'"}}, "required": ["asn"]},
+        ),
+        types.Tool(
+            name="gtiti_bgp_he_lookup",
+            description="Look up an ASN on Hurricane Electric's BGP Toolkit (bgp.he.net). Returns named IPv4/IPv6 peers (who this network actually peers with, by name), plus RPKI/prefix/peer summary counts, country of origin, and company website. Complements gtiti_bgp_classification (bgp.tools-based network-type classification) with HE's named peer view. Note: prefix lists themselves are not included (bgp.he.net loads those client-side) — use gtiti_verify_prefix_ownership or RIPEstat for actual prefixes. Use this when asked: 'who peers with AS15169?', 'show me Cogent's peers on Hurricane Electric', 'HE BGP toolkit view of this ASN'.",
+            inputSchema={"type": "object", "properties": {"asn": {"type": "string", "description": "ASN as a number or 'AS' prefixed string. Examples: '15169', 'AS15169', 'AS3320'"}}, "required": ["asn"]},
         ),
         types.Tool(
             name="gtiti_as_rank",
@@ -181,6 +187,11 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             if not asn:
                 raise ValueError("'asn' parameter is required.")
             result = await get_asn_classification(asn)
+        elif name == "gtiti_bgp_he_lookup":
+            asn = arguments.get("asn", "").strip()
+            if not asn:
+                raise ValueError("'asn' parameter is required.")
+            result = await get_bgp_he_lookup(asn)
         elif name == "gtiti_as_rank":
             asn = arguments.get("asn", "").strip()
             if not asn:
@@ -302,7 +313,7 @@ def main():
     print("🌐 GTITI MCP Server starting...", file=sys.stderr)
     print("   Phase 1: operator lookup · country operators · IXP lookup", file=sys.stderr)
     print("   Phase 2: news · crunchbase · submarine cables · contacts · full briefing", file=sys.stderr)
-    print("   Phase 3: bgp.tools · CAIDA · Cloudflare Radar · routing history · Shodan · IXPDB · SecurityTrails", file=sys.stderr)
+    print("   Phase 3: bgp.tools · bgp.he.net · CAIDA · Cloudflare Radar · routing history · Shodan · IXPDB · SecurityTrails", file=sys.stderr)
     print("   Ready. Waiting for Claude to connect...", file=sys.stderr)
     async def run():
         async with mcp.server.stdio.stdio_server() as (r, w):
